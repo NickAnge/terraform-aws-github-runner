@@ -39,6 +39,8 @@ export interface Ec2RunnerRequestContext {
 
 export interface Ec2RunnerResourceOperations {
   list(filters?: Ec2ListRunnerFilters): Promise<RunnerInfo[]>;
+  listPage?(environment: string, nextToken?: string): Promise<{ runners: RunnerInfo[]; nextToken?: string }>;
+
   create(runnerParameters: RunnerInputParameters): Promise<Ec2RunnerCreateResult>;
   terminate(instanceId: string): Promise<void>;
   tag(instanceId: string, tags: Tag[]): Promise<void>;
@@ -64,6 +66,17 @@ async function runWithRequestSignal<TResult>(
 export function createEc2RunnerClient(ec2Client: EC2Client): Ec2RunnerClient {
   return {
     forRequest: ({ signal }) => ({
+      listPage: async (environment, nextToken) => {
+        const page = await ec2Client.send(
+          new DescribeInstancesCommand({
+            Filters: constructFilters({ environment })[0],
+            NextToken: nextToken,
+            MaxResults: 10,
+          }),
+          { abortSignal: signal },
+        );
+        return { runners: getRunnerInfo(page), nextToken: page.NextToken };
+      },
       list: (filters) => runWithRequestSignal(signal, () => listEc2Runners(ec2Client, filters, signal)),
       create: (runnerParameters) =>
         runWithRequestSignal(signal, () => createEc2Runner(ec2Client, runnerParameters, signal)),
@@ -147,6 +160,9 @@ function getRunnerInfo(runningInstances: DescribeInstancesResult) {
         for (const i of r.Instances) {
           runners.push({
             id: i.InstanceId as string,
+            githubRunnerName: i.Tags?.some((tag) => tag.Key === 'ghr:runner_name_prefix')
+              ? `${i.Tags.find((tag) => tag.Key === 'ghr:runner_name_prefix')?.Value ?? ''}${i.InstanceId}`
+              : undefined,
             launchTime: i.LaunchTime,
             owner: i.Tags?.find((e) => e.Key === 'ghr:Owner')?.Value as string,
             type: i.Tags?.find((e) => e.Key === 'ghr:Type')?.Value as RunnerInfo['type'],

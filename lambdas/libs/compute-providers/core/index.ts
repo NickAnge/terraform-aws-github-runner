@@ -89,6 +89,7 @@ export interface RunnerInfo {
   org?: string;
   orphan?: boolean;
   githubRunnerId?: string;
+  githubRunnerName?: string;
   bypassRemoval?: boolean;
   /**
    * When scale-down first observed this runner reporting idle, as an ISO-8601 string.
@@ -106,6 +107,9 @@ export interface ListRunnerFilters {
 
 export interface ScaleDownComputeProvider extends ComputeProvider {
   list(environment: string, orphan?: boolean): Promise<RunnerInfo[]>;
+  /** Bounded inventory page for resumable cleanup; tokens are provider-specific. */
+  listPage?(environment: string, nextToken?: string): Promise<{ runners: RunnerInfo[]; nextToken?: string }>;
+
   bootTimeExceeded(runner: RunnerInfo): boolean;
   markOrphan(id: string): Promise<void>;
   unmarkOrphan(id: string): Promise<void>;

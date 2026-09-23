@@ -95,6 +95,7 @@ describe('list instances', () => {
       launchTime: new Date('2020-10-10T14:48:00.000+09:00'),
       type: 'Org',
       owner: 'CoderToCat',
+      githubRunnerName: 'i-1234',
       orphan: false,
       bypassRemoval: false,
     });
@@ -109,6 +110,7 @@ describe('list instances', () => {
       launchTime: new Date('2020-10-10T14:48:00.000+09:00'),
       type: 'Org',
       owner: 'CoderToCat',
+      githubRunnerName: 'i-1234',
       orphan: false,
       githubRunnerId: '9876543210',
       bypassRemoval: false,
@@ -130,6 +132,7 @@ describe('list instances', () => {
       launchTime: instances.Reservations![0].Instances![0].LaunchTime!,
       type: 'Org',
       owner: 'CoderToCat',
+      githubRunnerName: 'i-1234',
       orphan: true,
       bypassRemoval: false,
     });
@@ -1802,5 +1805,21 @@ describe('create runner with useDedicatedHost', () => {
     expect(runInstancesInput).not.toHaveProperty('MaxPrice');
     expect(runInstancesInput).not.toHaveProperty('Priority');
     expect(runInstancesInput).not.toHaveProperty('WeightedCapacity');
+  });
+});
+
+describe('resumable EC2 cleanup pages', () => {
+  it('returns one bounded page and its continuation without loading the next page', async () => {
+    mockEC2Client.reset();
+    mockEC2Client.on(DescribeInstancesCommand).resolves({ ...mockRunningInstances, NextToken: 'next-page' });
+    const page = await ec2Operations.listPage!('test-environment', 'current-page');
+    expect(mockEC2Client).toHaveReceivedCommandTimes(DescribeInstancesCommand, 1);
+    expect(mockEC2Client).toHaveReceivedCommandWith(DescribeInstancesCommand, {
+      MaxResults: 10,
+      NextToken: 'current-page',
+      Filters: expect.arrayContaining([{ Name: 'tag:ghr:environment', Values: ['test-environment'] }]),
+    });
+    expect(page.nextToken).toBe('next-page');
+    expect(page.runners[0].githubRunnerName).toBe('i-1234');
   });
 });

@@ -102,34 +102,32 @@ async function getGitHubRunnerBusyState(client: Octokit, runner: RunnerInfo, run
   return state.busy;
 }
 
-async function listGitHubRunners(runner: RunnerInfo): Promise<GhRunners> {
-  const key = runner.owner;
-  const cachedRunners = githubCache.runners.get(key);
-  if (cachedRunners) {
-    logger.debug(`[listGithubRunners] Cache hit for ${key}`);
-    return cachedRunners;
-  }
+function hasGitHubRunnerId(runner: RunnerInfo): boolean {
+  return /^[1-9]\d*$/.test(runner.githubRunnerId ?? '') && Number.isSafeInteger(Number(runner.githubRunnerId));
+}
 
-  logger.debug(`[listGithubRunners] Cache miss for ${key}`);
+async function listGitHubRunners(runner: RunnerInfo): Promise<GhRunners> {
   const client = await getOrCreateOctokit(runner);
-  let runners;
-  if (runner.type === 'Org') {
-    runners = await client.paginate(client.actions.listSelfHostedRunnersForOrg, {
-      org: runner.owner,
-      per_page: 100,
-    });
-  } else {
-    const [owner, repo] = runner.owner.split('/');
-    runners = await client.paginate(client.actions.listSelfHostedRunnersForRepo, {
-      owner,
-      repo,
-      per_page: 100,
-    });
+  if (hasGitHubRunnerId(runner)) {
+    const state = await getGitHubSelfHostedRunnerState(client, runner, Number(runner.githubRunnerId));
+    return state ? [state] : [];
   }
-  githubCache.runners.set(key, runners);
-  logger.debug(`[listGithubRunners] Cache set for ${key}`);
-  logger.debug(`[listGithubRunners] Runners: ${JSON.stringify(runners)}`);
-  return runners;
+  if (runner.githubRunnerName !== undefined) {
+    const owner =
+      runner.type === 'Org'
+        ? { org: runner.owner }
+        : {
+            owner: runner.owner.split('/')[0],
+            repo: runner.owner.split('/')[1],
+          };
+    const method =
+      runner.type === 'Org' ? client.actions.listSelfHostedRunnersForOrg : client.actions.listSelfHostedRunnersForRepo;
+    return client.paginate(method, { ...owner, name: runner.githubRunnerName, per_page: 100 });
+  }
+  // Without either identity we cannot establish absence with a bounded query.
+  // Do not let a legacy/incomplete record force an organization-wide inventory
+  // before other instances can be cleaned up.
+  throw new Error(`Runner '${runner.id}' has no GitHub ID or complete runner name; skipping unverifiable cleanup`);
 }
 
 function runnerMinimumTimeExceeded(runner: RunnerInfo): boolean {
@@ -283,8 +281,10 @@ async function evaluateAndRemoveRunners(
   runners: RunnerInfo[],
   scaleDownConfigs: ScalingDownConfigList,
   computeProvider: ScaleDownComputeProvider,
+  sweep = { idleRemaining: getIdleRunnerCount(scaleDownConfigs) },
+  remainingTime = () => Infinity,
 ): Promise<void> {
-  let idleCounter = getIdleRunnerCount(scaleDownConfigs);
+  let idleCounter = sweep.idleRemaining;
   const evictionStrategy = getEvictionStrategy(scaleDownConfigs);
   const ownerTags = new Set(runners.map((runner) => runner.owner));
 
@@ -295,35 +295,41 @@ async function evaluateAndRemoveRunners(
     logger.debug(`Found: '${ownerRunners.length}' active GitHub runners with owner tag: '${ownerTag}'`);
     logger.debug(`Active GitHub runners with owner tag: '${ownerTag}': ${JSON.stringify(ownerRunners)}`);
     for (const runner of ownerRunners) {
-      if (runner.bypassRemoval) {
-        logger.debug(`Runner '${runner.id}' has bypass-removal tag set, skipping evaluation.`);
-        continue;
-      }
-      const ghRunners = await listGitHubRunners(runner);
-      const ghRunnersFiltered = ghRunners.filter((ghRunner: { name: string }) => ghRunner.name.endsWith(runner.id));
-      logger.debug(`Found: '${ghRunnersFiltered.length}' GitHub runners for runner: '${runner.id}'`);
-      logger.debug(`GitHub runners for runner: '${runner.id}': ${JSON.stringify(ghRunnersFiltered)}`);
-      if (ghRunnersFiltered.length) {
-        if (runnerMinimumTimeExceeded(runner)) {
-          if (idleCounter > 0) {
-            idleCounter--;
-            // A runner kept idle is not evaluated for removal, so its idle marker cannot be
-            // refreshed by busy readings. Clear it so a later evaluation starts a fresh window.
-            await clearIdleDetection(runner, computeProvider);
-            logger.info(`Runner '${runner.id}' will be kept idle.`);
-          } else {
-            logger.info(`Terminating all non busy runners.`);
-            await removeRunner(
-              runner,
-              ghRunnersFiltered.map((runner: { id: number }) => runner.id),
-              computeProvider,
-            );
-          }
+      if (remainingTime() < 10000) return;
+      try {
+        if (runner.bypassRemoval) {
+          logger.debug(`Runner '${runner.id}' has bypass-removal tag set, skipping evaluation.`);
+          continue;
         }
-      } else if (computeProvider.bootTimeExceeded(runner)) {
-        await markOrphan(runner.id, computeProvider);
-      } else {
-        logger.debug(`Runner ${runner.id} has not yet booted.`);
+        const ghRunners = await listGitHubRunners(runner);
+        const ghRunnersFiltered = ghRunners.filter((ghRunner: { name: string }) => ghRunner.name.endsWith(runner.id));
+        logger.debug(`Found: '${ghRunnersFiltered.length}' GitHub runners for runner: '${runner.id}'`);
+        logger.debug(`GitHub runners for runner: '${runner.id}': ${JSON.stringify(ghRunnersFiltered)}`);
+        if (ghRunnersFiltered.length) {
+          if (runnerMinimumTimeExceeded(runner)) {
+            if (idleCounter > 0) {
+              idleCounter--;
+              sweep.idleRemaining = idleCounter;
+              // A runner kept idle is not evaluated for removal, so its idle marker cannot be
+              // refreshed by busy readings. Clear it so a later evaluation starts a fresh window.
+              await clearIdleDetection(runner, computeProvider);
+              logger.info(`Runner '${runner.id}' will be kept idle.`);
+            } else {
+              logger.info(`Terminating all non busy runners.`);
+              await removeRunner(
+                runner,
+                ghRunnersFiltered.map((runner: { id: number }) => runner.id),
+                computeProvider,
+              );
+            }
+          }
+        } else if (computeProvider.bootTimeExceeded(runner)) {
+          await markOrphan(runner.id, computeProvider);
+        } else {
+          logger.debug(`Runner ${runner.id} has not yet booted.`);
+        }
+      } catch (error) {
+        logger.warn(`Failed to evaluate runner '${runner.id}'; continuing cleanup.`, { error });
       }
     }
   }
@@ -367,31 +373,46 @@ async function lastChanceCheckOrphanRunner(runner: RunnerInfo): Promise<boolean>
   return isOrphan;
 }
 
-async function terminateOrphan(environment: string, computeProvider: ScaleDownComputeProvider): Promise<void> {
+async function terminateOrphan(
+  environment: string,
+  computeProvider: ScaleDownComputeProvider,
+  page?: RunnerInfo[],
+  remainingTime = () => Infinity,
+): Promise<void> {
+  let orphanRunners: RunnerInfo[];
   try {
-    const orphanRunners = await computeProvider.list(environment, true);
+    orphanRunners = page ?? (await computeProvider.list(environment, true));
+  } catch (error) {
+    logger.warn('Failed to list orphan runners.', { error });
+    return;
+  }
 
-    for (const runner of orphanRunners) {
-      if (runner.bypassRemoval) {
-        logger.info(`Orphan runner '${runner.id}' has bypass-removal tag set, skipping termination.`);
-        continue;
-      }
-      if (runner.githubRunnerId) {
-        const isOrphan = await lastChanceCheckOrphanRunner(runner);
-        if (isOrphan) {
-          await computeProvider.terminate(runner.id);
-        } else {
-          await unMarkOrphan(runner.id, computeProvider);
-        }
-      } else {
-        logger.info(`Terminating orphan runner '${runner.id}'`);
-        await computeProvider.terminate(runner.id).catch((e) => {
-          logger.error(`Failed to terminate orphan runner '${runner.id}'`, { error: e });
-        });
-      }
+  for (const runner of orphanRunners) {
+    if (remainingTime() < 10000) return;
+    if (runner.bypassRemoval) {
+      logger.info(`Orphan runner '${runner.id}' has bypass-removal tag set, skipping termination.`);
+      continue;
     }
-  } catch (e) {
-    logger.warn(`Failure during orphan termination processing.`, { error: e });
+    if (!runner.owner || !runner.type) {
+      logger.warn(`Cannot verify orphan runner '${runner.id}' without its owner and type, skipping termination.`);
+      continue;
+    }
+    try {
+      // A runner can register after it was marked orphan, even if writing its
+      // registration ID back to the compute provider failed. Check GitHub again.
+      const isOrphan = hasGitHubRunnerId(runner)
+        ? await lastChanceCheckOrphanRunner(runner)
+        : !(await listGitHubRunners(runner)).some((registered) => registered.name.endsWith(runner.id));
+      if (isOrphan) {
+        await computeProvider.terminate(runner.id);
+      } else {
+        await unMarkOrphan(runner.id, computeProvider);
+      }
+    } catch (error) {
+      // Leave this runner for a later invocation without blocking other owners
+      // or runners when one GitHub request or provider termination fails.
+      logger.warn(`Failed to process orphan runner '${runner.id}'.`, { error });
+    }
   }
 }
 
@@ -417,7 +438,7 @@ function filterRunners(runners: RunnerInfo[]): RunnerInfo[] {
   return runners.filter((runner) => runner.owner && runner.type && !runner.orphan);
 }
 
-export async function scaleDown(): Promise<void> {
+export async function scaleDown(remainingTime = () => Infinity): Promise<void> {
   githubCache.reset();
   const environment = process.env.ENVIRONMENT;
   const scaleDownConfigs = JSON.parse(process.env.SCALE_DOWN_CONFIG) as ScalingDownConfigList;
@@ -426,6 +447,30 @@ export async function scaleDown(): Promise<void> {
     ...controlPlaneProviderRegistry.capability(computeProviderType, 'scaleDown')(),
     type: computeProviderType,
   };
+
+  if (computeProvider.listPage) {
+    const sweep = { idleRemaining: getIdleRunnerCount(scaleDownConfigs) };
+    let nextToken: string | undefined;
+    do {
+      if (remainingTime() < 10000) return;
+      const page = await computeProvider.listPage(environment, nextToken);
+      await terminateOrphan(
+        environment,
+        computeProvider,
+        page.runners.filter((runner) => runner.orphan),
+        remainingTime,
+      );
+      await evaluateAndRemoveRunners(
+        filterRunners(page.runners),
+        scaleDownConfigs,
+        computeProvider,
+        sweep,
+        remainingTime,
+      );
+      nextToken = page.nextToken;
+    } while (nextToken);
+    return;
+  }
 
   // first runners marked to be orphan.
   await terminateOrphan(environment, computeProvider);
