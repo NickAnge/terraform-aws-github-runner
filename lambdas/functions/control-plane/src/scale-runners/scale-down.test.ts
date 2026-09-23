@@ -6,6 +6,7 @@ import { defaultComputeProvider } from '@aws-github-runner/compute-providers/pro
 
 import { controlPlaneProviderRegistry } from '../control-plane-providers';
 import * as ghAuth from '../github/auth';
+import * as rateLimit from '../github/rate-limit';
 import { githubCache } from './cache';
 import { newestFirstStrategy, oldestFirstStrategy, scaleDown } from './scale-down';
 import type { RunnerInfo, RunnerType, ScaleDownComputeProvider } from './types';
@@ -18,6 +19,7 @@ vi.mock('../github/auth', () => ({
 }));
 
 const mockOctokit = {
+  hook: { after: vi.fn() },
   apps: {
     getOrgInstallation: vi.fn(),
     getRepoInstallation: vi.fn(),
@@ -260,6 +262,33 @@ describe('Scale down runners', () => {
       installationId: 0,
     });
     mockCreateClient.mockResolvedValue(mockOctokit as unknown as Octokit);
+  });
+
+  it('selects Apps before owner-cache lookup and attributes response quota to the selected App', async () => {
+    process.env.SCALE_DOWN_CONFIG = '[]';
+    const runners = ['first', 'second', 'third'].map((id) => createRunnerTestData(id, 'Org', 60, true, false, false));
+    mockGitHubRunners(runners);
+    mockListRunners.mockResolvedValueOnce([]).mockResolvedValueOnce(runners).mockResolvedValue([]);
+    const authentication = { type: 'app' as const, token: 'token', appId: 1 };
+    mockedAppAuth
+      .mockResolvedValueOnce({ ...authentication, appIndex: 0 })
+      .mockResolvedValue({ ...authentication, appIndex: 1 });
+    vi.mocked(ghAuth.getStoredInstallationId).mockResolvedValue(123);
+    const metric = vi.spyOn(rateLimit, 'metricGitHubAppRateLimit').mockResolvedValue();
+    try {
+      await scaleDown();
+      expect(mockedInstallationAuth).toHaveBeenCalledTimes(2);
+      expect(mockedInstallationAuth).toHaveBeenCalledWith(123, '', 0);
+      expect(mockedInstallationAuth).toHaveBeenCalledWith(123, '', 1);
+      expect(githubCache.clients.has(`0:Org:${runners[0].owner}`)).toBe(true);
+      expect(githubCache.clients.has(`1:Org:${runners[0].owner}`)).toBe(true);
+      const headers = { 'x-ratelimit-remaining': '17', 'x-ratelimit-limit': '5000' };
+      await mockOctokit.hook.after.mock.calls[1][1]({ headers });
+      expect(metric).toHaveBeenCalledWith(headers, 1);
+    } finally {
+      metric.mockRestore();
+      vi.mocked(ghAuth.getStoredInstallationId).mockResolvedValue(undefined);
+    }
   });
 
   const endpoints = ['https://api.github.com', 'https://github.enterprise.something', 'https://companyname.ghe.com'];
